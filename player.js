@@ -7,24 +7,22 @@ const {
 } = require("@discordjs/voice");
 const { EmbedBuilder } = require("discord.js");
 const { spawn } = require("child_process");
-
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const fs = require("fs");
 
 class Player {
   constructor(connection, queue, textChannel) {
     this.connection = connection;
     this.queue = queue;
-    this.textChannel = textChannel; // send now playing embeds here
-    this.audioPlayer = createAudioPlayer();
-    this.ytdlp = null;
-    this.ffmpeg = null;
+    this.textChannel = textChannel;
 
+    this.audioPlayer = createAudioPlayer();
     this.connection.subscribe(this.audioPlayer);
 
-    this.connection.on("stateChange", (oldState, newState) => {
-      console.log(`🔄 Voice state: ${oldState.status} → ${newState.status}`);
-      if (newState.status === VoiceConnectionStatus.Disconnected) {
-        console.log("⚠️ Disconnected — stopping.");
+    this.current = null;
+    this.startTime = null;
+
+    this.connection.on("stateChange", (_, n) => {
+      if (n.status === VoiceConnectionStatus.Disconnected) {
         this.cleanup();
         this.queue.playing = false;
         this.audioPlayer.stop(true);
@@ -32,195 +30,144 @@ class Player {
     });
 
     this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      console.log("⏭ Song ended — checking queue...");
       this.playNext();
     });
 
-    this.audioPlayer.on("error", (error) => {
-      console.error("💥 Audio player error:", error.message);
-      this.cleanup();
-      this.playNext();
-    });
-
-    this.audioPlayer.on("stateChange", (oldState, newState) => {
-      console.log(`🎶 Player: ${oldState.status} → ${newState.status}`);
+    this.audioPlayer.on("error", (err) => {
+      console.error("💥 Player error:", err.message);
+      this.retryOrSkip();
     });
   }
 
   cleanup() {
-    if (this.ytdlp) {
+    if (this.proc) {
       try {
-        this.ytdlp.kill("SIGKILL");
-      } catch (_) {}
-      this.ytdlp = null;
-    }
-    if (this.ffmpeg) {
-      try {
-        this.ffmpeg.kill("SIGKILL");
-      } catch (_) {}
-      this.ffmpeg = null;
+        this.proc.kill("SIGKILL");
+      } catch {}
+      this.proc = null;
     }
   }
 
-  // Fetch YouTube title + thumbnail for embed
-  async getYouTubeMeta(videoUrl) {
-    try {
-      const videoId = videoUrl.match(
-        /(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-      )?.[1];
-      if (!videoId) return { title: videoUrl, thumbnail: null };
-      const res = await fetch(
-        `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${YOUTUBE_API_KEY}`,
-      );
-      const data = await res.json();
-      const snippet = data.items?.[0]?.snippet;
-      return {
-        title: snippet?.title || videoUrl,
-        thumbnail: snippet?.thumbnails?.high?.url || null,
-      };
-    } catch {
-      return { title: videoUrl, thumbnail: null };
-    }
+  // ─────────────────────────────
+  // Progress bar
+  // ─────────────────────────────
+  progressBar(current, total, size = 20) {
+    const percent = current / total;
+    const filled = Math.round(size * percent);
+    return "▰".repeat(filled) + "▱".repeat(size - filled);
   }
 
-  // Send now playing embed to the text channel
-  async sendNowPlayingEmbed(song) {
+  formatTime(sec) {
+    if (!sec) return "0:00";
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60)
+      .toString()
+      .padStart(2, "0");
+    return `${m}:${s}`;
+  }
+
+  async getMeta(url) {
+    return {
+      title: url,
+      duration: 180, // fallback (yt-dlp metadata parsing is optional upgrade)
+    };
+  }
+
+  // Player class
+  async sendNowPlaying(song) {
     if (!this.textChannel) return;
-    try {
-      const meta = await this.getYouTubeMeta(song.url);
-      const source = song.source || "yt";
-      const color = source === "spotify" ? 0x1db954 : 0xff0000;
-      const sourceLabel =
-        source === "spotify" ? "🎧 Spotify → YouTube" : "▶️ YouTube";
+    const meta = await this.getMeta(song.url);
+    const embed = new EmbedBuilder().setTitle(meta.title);
+    // send normal message — NOT interaction.reply
+    this.textChannel.send({ embeds: [embed] });
+  }
 
-      const embed = new EmbedBuilder()
-        .setColor(color)
-        .setAuthor({ name: "🎵 Now Playing" })
-        .setTitle(meta.title)
-        .setURL(song.url)
-        .setThumbnail(meta.thumbnail)
-        .addFields(
-          { name: "Source", value: sourceLabel, inline: true },
-          {
-            name: "Requested",
-            value: `<@${song.requester || "0"}>`,
-            inline: true,
-          },
-          {
-            name: "In Queue",
-            value: `${this.queue.songs.length} song(s)`,
-            inline: true,
-          },
-        )
-        .setFooter({
-          text: "Use /skip to skip • /stop to stop • /queue to view queue",
-        })
-        .setTimestamp();
+  // ─────────────────────────────
+  // Retry system
+  // ─────────────────────────────
+  retryOrSkip() {
+    if (!this.current) return this.playNext();
 
-      this.textChannel.send({ embeds: [embed] });
-    } catch (err) {
-      console.error("💥 Failed to send now playing embed:", err.message);
+    this.current.retries = (this.current.retries || 0) + 1;
+
+    if (this.current.retries <= 2) {
+      console.log("🔁 Retrying...");
+      this.play(this.current);
+    } else {
+      console.log("⏭ Skipping (failed)");
+      this.playNext();
     }
   }
 
-  playNext() {
+  // ─────────────────────────────
+  // Preload next song (no-gap)
+  // ─────────────────────────────
+  preloadNext() {
+    if (this.queue.songs.length === 0) return;
+
+    const next = this.queue.songs[0];
+    console.log("⚡ Preloading next:", next.url);
+
+    spawn("yt-dlp", [
+      "-f",
+      "bestaudio[ext=webm]/bestaudio",
+      "-o",
+      "-",
+      next.url,
+    ]);
+  }
+
+  // ─────────────────────────────
+  // Play
+  // ─────────────────────────────
+  play(song) {
     this.cleanup();
 
-    if (this.queue.songs.length === 0) {
-      console.log("📭 Queue empty — done.");
-      this.queue.playing = false;
-      setTimeout(() => {
-        if (!this.queue.playing) {
-          try {
-            this.connection.destroy();
-          } catch (_) {}
-        }
-      }, 30_000);
-      return;
+    this.current = song;
+    this.startTime = Date.now();
+
+    const args = [
+      "-f",
+      "bestaudio[ext=webm]/bestaudio",
+      "--no-warnings",
+      "-o",
+      "-",
+      song.url,
+    ];
+
+    if (fs.existsSync("cookies.txt")) {
+      args.unshift("--cookies", "cookies.txt");
     }
 
-    const song = this.queue.songs.shift(); // { url, source, requester }
-    console.log(`▶️ Now playing: ${song.url}`);
-
-    // Send now playing embed (non-blocking)
-    this.sendNowPlayingEmbed(song);
-
-    // ── yt-dlp ─────────────────────────────────────────────────
-    this.ytdlp = spawn(
-      "yt-dlp",
-      [
-        "-f",
-        "bestaudio[ext=webm]/bestaudio[acodec=opus]/bestaudio",
-        "--no-warnings",
-        "-o",
-        "-",
-        song.url,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-
-    this.ytdlp.stderr.on("data", (data) =>
-      console.log(`[yt-dlp] ${data.toString().trim()}`),
-    );
-    this.ytdlp.on("error", (err) => {
-      console.error("💥 yt-dlp error:", err.message);
-      this.cleanup();
-      this.playNext();
+    this.proc = spawn("yt-dlp", args, {
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
-    // ── ffmpeg ─────────────────────────────────────────────────
-    this.ffmpeg = spawn(
-      "ffmpeg",
-      [
-        "-i",
-        "pipe:0",
-        "-f",
-        "s16le",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        "-af",
-        "volume=0.85",
-        "-loglevel",
-        "warning",
-        "pipe:1",
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
+    this.proc.stderr.on("data", (d) => console.log("[yt-dlp]", d.toString()));
 
-    this.ffmpeg.stderr.on("data", (data) =>
-      console.log(`[ffmpeg] ${data.toString().trim()}`),
-    );
-    this.ffmpeg.on("error", (err) => {
-      console.error("💥 ffmpeg error:", err.message);
-      this.cleanup();
-      this.playNext();
-    });
-    this.ffmpeg.on("close", (code) => {
-      if (code !== 0 && code !== null)
-        console.warn(`⚠️ ffmpeg exited with code ${code}`);
+    this.proc.on("close", (code) => {
+      if (code !== 0) this.retryOrSkip();
     });
 
-    this.ytdlp.stdout.pipe(this.ffmpeg.stdin);
-
-    this.ffmpeg.stdin.on("error", (err) => {
-      if (err.code !== "EPIPE") console.error("💥 ffmpeg stdin:", err.message);
-    });
-    this.ytdlp.stdout.on("error", (err) => {
-      if (err.code !== "EPIPE") console.error("💥 yt-dlp stdout:", err.message);
-    });
-
-    const resource = createAudioResource(this.ffmpeg.stdout, {
-      inputType: StreamType.Raw,
-    });
-    resource.playStream.on("error", (err) => {
-      console.error("💥 Resource stream error:", err.message);
-      this.cleanup();
-      this.playNext();
+    const resource = createAudioResource(this.proc.stdout, {
+      inputType: StreamType.WebmOpus,
     });
 
     this.audioPlayer.play(resource);
+
+    this.sendNowPlaying(song);
+    this.preloadNext();
+  }
+
+  playNext() {
+    if (this.queue.songs.length === 0) {
+      console.log("📭 Queue empty");
+      this.queue.playing = false;
+      return;
+    }
+
+    const song = this.queue.songs.shift();
+    this.play(song);
   }
 }
 

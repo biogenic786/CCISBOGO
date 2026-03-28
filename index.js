@@ -1,3 +1,4 @@
+const fs = require("fs");
 const {
   Client,
   GatewayIntentBits,
@@ -21,6 +22,11 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+
+if (process.env.YT_COOKIES) {
+  fs.writeFileSync("cookies.txt", process.env.YT_COOKIES);
+  console.log("🍪 cookies loaded from env");
+}
 
 const queues = new Map();
 const players = new Map();
