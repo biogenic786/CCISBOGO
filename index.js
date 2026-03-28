@@ -1,173 +1,413 @@
-const { Client, GatewayIntentBits } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActivityType,
+} = require("discord.js");
 const { joinVoiceChannel } = require("@discordjs/voice");
+const { execFile } = require("child_process");
 const Queue = require("./queue");
 const Player = require("./player");
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
+    // Note: MessageContent intent no longer needed for slash commands
   ],
 });
-client.once("ready", () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-});
+
 const TOKEN = process.env.DISCORD_TOKEN;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 
 const queues = new Map();
 const players = new Map();
 
-client.once("ready", () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-});
+// ─────────────────────────────────────────────────────────────
+// Rate limiting — 3 second cooldown per user per command
+// ─────────────────────────────────────────────────────────────
+const cooldowns = new Map();
+
+function isOnCooldown(userId, seconds = 3) {
+  const now = Date.now();
+  const last = cooldowns.get(userId) || 0;
+  if (now - last < seconds * 1000) {
+    const remaining = ((seconds * 1000 - (now - last)) / 1000).toFixed(1);
+    return remaining; // returns seconds remaining as string
+  }
+  cooldowns.set(userId, now);
+  return false;
+}
 
 // ─────────────────────────────────────────────────────────────
-// Resolve a query into an array of songs:
-//   - Playlist URL  → array of all video URLs
-//   - Single URL    → [url]
-//   - Search term   → ['ytsearch1:term']
+// Now Playing embed builder
 // ─────────────────────────────────────────────────────────────
-function resolveQuery(query) {
-  return new Promise((resolve, reject) => {
-    const isUrl = query.startsWith("http://") || query.startsWith("https://");
-    const isPlaylist =
-      query.includes("playlist?list=") ||
-      query.includes("&list=") ||
-      query.includes("/sets/"); // SoundCloud playlists
+function buildNowPlayingEmbed({
+  title,
+  url,
+  thumbnail,
+  requester,
+  source,
+  queueLength,
+}) {
+  const sourceEmoji =
+    source === "spotify" ? "🎧 Spotify → YouTube" : "▶️ YouTube";
+  const color = source === "spotify" ? 0x1db954 : 0xff0000;
 
-    if (isPlaylist) {
-      console.log(`📋 Detected playlist — extracting URLs...`);
+  return new EmbedBuilder()
+    .setColor(color)
+    .setAuthor({ name: "🎵 Now Playing" })
+    .setTitle(title || "Unknown Title")
+    .setURL(url || null)
+    .setThumbnail(thumbnail || null)
+    .addFields(
+      { name: "Source", value: sourceEmoji, inline: true },
+      { name: "Requested", value: `<@${requester}>`, inline: true },
+      { name: "In Queue", value: `${queueLength} song(s)`, inline: true },
+    )
+    .setFooter({
+      text: "Use /skip to skip • /stop to stop • /queue to view queue",
+    })
+    .setTimestamp();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fetch YouTube video metadata (title + thumbnail)
+// ─────────────────────────────────────────────────────────────
+async function getYouTubeMeta(videoUrl) {
+  try {
+    const videoId = videoUrl.match(
+      /(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    )?.[1];
+    if (!videoId) return { title: videoUrl, thumbnail: null };
+
+    const res = await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${YOUTUBE_API_KEY}`,
+    );
+    const data = await res.json();
+    const snippet = data.items?.[0]?.snippet;
+
+    return {
+      title: snippet?.title || videoUrl,
+      thumbnail: snippet?.thumbnails?.high?.url || null,
+    };
+  } catch {
+    return { title: videoUrl, thumbnail: null };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Spotify auth
+// ─────────────────────────────────────────────────────────────
+let spotifyToken = null;
+let spotifyTokenExpiry = 0;
+
+async function getSpotifyToken() {
+  if (spotifyToken && Date.now() < spotifyTokenExpiry) return spotifyToken;
+  const creds = Buffer.from(
+    `${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`,
+  ).toString("base64");
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${creds}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+  const data = await res.json();
+  spotifyToken = data.access_token;
+  spotifyTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  console.log("🎧 Spotify token refreshed");
+  return spotifyToken;
+}
+
+async function getSpotifyTrack(trackId) {
+  const token = await getSpotifyToken();
+  const res = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  return `${data.name} - ${data.artists?.[0]?.name}`;
+}
+
+async function getSpotifyPlaylist(playlistId) {
+  const token = await getSpotifyToken();
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+  while (url) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    for (const item of data.items) {
+      const t = item.track;
+      if (t?.name) tracks.push(`${t.name} - ${t.artists?.[0]?.name || ""}`);
+    }
+    url = data.next;
+  }
+  return tracks;
+}
+
+async function getSpotifyAlbum(albumId) {
+  const token = await getSpotifyToken();
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`;
+  while (url) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    for (const t of data.items)
+      tracks.push(`${t.name} - ${t.artists?.[0]?.name || ""}`);
+    url = data.next;
+  }
+  return tracks;
+}
+
+// ─────────────────────────────────────────────────────────────
+// YouTube search
+// ─────────────────────────────────────────────────────────────
+async function searchYouTube(query) {
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(query)}&type=video&maxResults=1&key=${YOUTUBE_API_KEY}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const videoId = data.items?.[0]?.id?.videoId;
+  if (!videoId) throw new Error(`No YouTube results for: ${query}`);
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse Spotify URL
+// ─────────────────────────────────────────────────────────────
+function parseSpotifyUrl(url) {
+  const match = url.match(
+    /spotify\.com\/(track|playlist|album)\/([a-zA-Z0-9]+)/,
+  );
+  if (!match) return null;
+  return { type: match[1], id: match[2] };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Main resolver — always returns { urls: [], source: 'yt'|'spotify' }
+// ─────────────────────────────────────────────────────────────
+async function resolveQuery(query) {
+  const isUrl = query.startsWith("http://") || query.startsWith("https://");
+  const isPlaylist =
+    query.includes("playlist?list=") ||
+    query.includes("&list=") ||
+    query.includes("/sets/");
+
+  // ── Spotify ────────────────────────────────────────────────
+  if (isUrl && query.includes("spotify.com")) {
+    const spotify = parseSpotifyUrl(query);
+    if (!spotify) throw new Error("Invalid Spotify URL");
+
+    if (spotify.type === "track") {
+      const searchTerm = await getSpotifyTrack(spotify.id);
+      const ytUrl = await searchYouTube(searchTerm);
+      return { urls: [ytUrl], source: "spotify" };
+    }
+
+    if (spotify.type === "playlist") {
+      const tracks = await getSpotifyPlaylist(spotify.id);
+      const urls = [];
+      for (const t of tracks) {
+        try {
+          urls.push(await searchYouTube(t));
+        } catch {
+          /* skip unfound */
+        }
+      }
+      return { urls, source: "spotify" };
+    }
+
+    if (spotify.type === "album") {
+      const tracks = await getSpotifyAlbum(spotify.id);
+      const urls = [];
+      for (const t of tracks) {
+        try {
+          urls.push(await searchYouTube(t));
+        } catch {
+          /* skip unfound */
+        }
+      }
+      return { urls, source: "spotify" };
+    }
+  }
+
+  // ── YouTube playlist ───────────────────────────────────────
+  if (isUrl && isPlaylist) {
+    return new Promise((resolve, reject) => {
       execFile(
         "yt-dlp",
         ["--flat-playlist", "--print", "%(url)s", "--no-warnings", query],
-        { maxBuffer: 10 * 1024 * 1024 }, // 10MB buffer for large playlists
+        { maxBuffer: 10 * 1024 * 1024 },
         (err, stdout, stderr) => {
           if (err) {
-            console.error("💥 Playlist extraction error:", stderr);
+            console.error("💥 Playlist error:", stderr);
             return reject(err);
           }
           const urls = stdout.trim().split("\n").filter(Boolean);
-          console.log(`📋 Found ${urls.length} songs in playlist`);
-          resolve(urls);
+          resolve({ urls, source: "yt" });
         },
       );
-    } else if (isUrl) {
-      resolve([query]);
-    } else {
-      // Name-based search — player.js prepends ytsearch1:
-      resolve([query]);
-    }
-  });
+    });
+  }
+
+  // ── YouTube single URL ─────────────────────────────────────
+  if (isUrl) return { urls: [query], source: "yt" };
+
+  // ── Search by name ─────────────────────────────────────────
+  const ytUrl = await searchYouTube(query);
+  return { urls: [ytUrl], source: "yt" };
 }
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith("!")) return;
+// ─────────────────────────────────────────────────────────────
+// Bot ready
+// ─────────────────────────────────────────────────────────────
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  client.user.setActivity("music 🎵", { type: ActivityType.Listening });
+});
 
-  console.log(`📩 ${message.author.tag}: ${message.content}`);
+// ─────────────────────────────────────────────────────────────
+// Slash command handler
+// ─────────────────────────────────────────────────────────────
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-  const args = message.content.slice(1).trim().split(/ +/);
-  const command = args.shift().toLowerCase();
+  const { commandName, user, member, guild } = interaction;
 
-  // ─────────────────────────────────────────────
-  // 🎵 PLAY  (!play / !p)
-  // ─────────────────────────────────────────────
-  if (command === "play" || command === "p") {
-    const query = args.join(" ");
-    if (!query)
-      return message.reply(
-        "❌ Provide a song name, YouTube URL, or playlist URL.",
-      );
+  // ── Rate limit check ───────────────────────────────────────
+  const cooldown = isOnCooldown(user.id, 3);
+  if (cooldown) {
+    return interaction.reply({
+      content: `⏳ Slow down! Wait **${cooldown}s** before using another command.`,
+      ephemeral: true, // only visible to the user who triggered it
+    });
+  }
 
-    const vc = message.member?.voice?.channel;
-    if (!vc) return message.reply("❌ Join a voice channel first.");
+  console.log(`📩 /${commandName} by ${user.tag}`);
 
-    const isPlaylist =
-      query.includes("playlist?list=") ||
-      query.includes("&list=") ||
-      query.includes("/sets/");
+  // ────────────────────────────────────────────────────────────
+  // /play
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "play") {
+    const query = interaction.options.getString("query");
+    const vc = member?.voice?.channel;
+    if (!vc)
+      return interaction.reply({
+        content: "❌ Join a voice channel first.",
+        ephemeral: true,
+      });
 
-    if (isPlaylist) {
-      message.reply("📋 Loading playlist, please wait...");
-    }
+    const isSpotifyPlaylist =
+      query.includes("spotify.com/playlist") ||
+      query.includes("spotify.com/album");
+    const isYtPlaylist =
+      query.includes("playlist?list=") || query.includes("&list=");
 
-    let songs;
+    // Defer reply for operations that take time
+    await interaction.deferReply();
+
+    let result;
     try {
-      songs = await resolveQuery(query);
+      result = await resolveQuery(query);
     } catch (err) {
       console.error("💥 resolveQuery failed:", err);
-      return message.reply(
-        "❌ Failed to load that playlist or URL. Is it public?",
+      return interaction.editReply(
+        "❌ Failed to load that link. Is it public?",
       );
     }
 
-    if (songs.length === 0) return message.reply("❌ No songs found.");
+    const { urls, source } = result;
+    if (!urls || urls.length === 0)
+      return interaction.editReply("❌ No songs found.");
 
-    let serverQueue = queues.get(message.guild.id);
+    let serverQueue = queues.get(guild.id);
     if (!serverQueue) {
       serverQueue = new Queue();
-      queues.set(message.guild.id, serverQueue);
+      queues.set(guild.id, serverQueue);
     }
 
-    songs.forEach((s) => serverQueue.add(s));
-
-    if (songs.length === 1) {
-      message.reply(`✅ Added to queue: **${query}**`);
-    } else {
-      message.reply(`✅ Added **${songs.length}** songs to queue!`);
-    }
+    // Store source alongside each URL for embed use
+    urls.forEach((url) => serverQueue.add({ url, source, requester: user.id }));
 
     if (!serverQueue.playing) {
       const connection = joinVoiceChannel({
         channelId: vc.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
       });
 
-      const player = new Player(connection, serverQueue);
-      players.set(message.guild.id, player);
+      const player = new Player(connection, serverQueue, interaction.channel);
+      players.set(guild.id, player);
       serverQueue.playing = true;
       player.playNext();
     }
-    return;
+
+    // Reply
+    if (urls.length === 1) {
+      const meta = await getYouTubeMeta(urls[0]);
+      const embed = buildNowPlayingEmbed({
+        title: meta.title,
+        url: urls[0],
+        thumbnail: meta.thumbnail,
+        requester: user.id,
+        source,
+        queueLength: serverQueue.songs.length,
+      });
+      return interaction.editReply({ embeds: [embed] });
+    } else {
+      const sourceLabel = source === "spotify" ? "🎧 Spotify" : "📋 YouTube";
+      return interaction.editReply(
+        `${sourceLabel} — Added **${urls.length}** songs to queue!`,
+      );
+    }
   }
 
-  // ─────────────────────────────────────────────
-  // ⏭ SKIP  (!skip / !s)
-  // ─────────────────────────────────────────────
-  if (command === "skip" || command === "s") {
-    const player = players.get(message.guild.id);
-    if (!player) return message.reply("❌ Nothing is playing.");
+  // ────────────────────────────────────────────────────────────
+  // /skip
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "skip") {
+    const player = players.get(guild.id);
+    if (!player)
+      return interaction.reply({
+        content: "❌ Nothing is playing.",
+        ephemeral: true,
+      });
     player.audioPlayer.stop();
-    message.reply("⏭ Skipped!");
-    return;
+    return interaction.reply("⏭ Skipped!");
   }
 
-  // ─────────────────────────────────────────────
-  // ⛔ STOP  (!stop)
-  // ─────────────────────────────────────────────
-  if (command === "stop") {
-    const player = players.get(message.guild.id);
+  // ────────────────────────────────────────────────────────────
+  // /stop
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "stop") {
+    const player = players.get(guild.id);
     if (player) {
       player.cleanup();
       player.audioPlayer.stop(true);
       player.connection.destroy();
     }
-    queues.delete(message.guild.id);
-    players.delete(message.guild.id);
-    message.reply("⛔ Stopped and left the channel.");
-    return;
+    queues.delete(guild.id);
+    players.delete(guild.id);
+    return interaction.reply("⛔ Stopped and left the channel.");
   }
 
-  // ─────────────────────────────────────────────
-  // 📋 QUEUE  (!queue / !q)
-  // ─────────────────────────────────────────────
-  if (command === "queue" || command === "q") {
-    const serverQueue = queues.get(message.guild.id);
+  // ────────────────────────────────────────────────────────────
+  // /queue
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "queue") {
+    const serverQueue = queues.get(guild.id);
     if (!serverQueue || serverQueue.songs.length === 0) {
-      return message.reply("📭 Queue is empty.");
+      return interaction.reply({
+        content: "📭 Queue is empty.",
+        ephemeral: true,
+      });
     }
 
     const preview = serverQueue.songs.slice(0, 10);
@@ -175,60 +415,52 @@ client.on("messageCreate", async (message) => {
 
     const list = preview
       .map((s, i) => {
-        const display = s.startsWith("http") ? s.substring(0, 60) + "..." : s;
+        const display = s.url.startsWith("http")
+          ? s.url.substring(0, 55) + "..."
+          : s.url;
         return `${i + 1}. ${display}`;
       })
       .join("\n");
 
-    let reply = `📋 **Queue (${serverQueue.songs.length} songs):**\n${list}`;
-    if (remaining > 0) reply += `\n_...and ${remaining} more_`;
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle(`📋 Queue — ${serverQueue.songs.length} song(s)`)
+      .setDescription(
+        list + (remaining > 0 ? `\n_...and ${remaining} more_` : ""),
+      );
 
-    message.reply(reply);
-    return;
+    return interaction.reply({ embeds: [embed] });
   }
 
-  // ─────────────────────────────────────────────
-  // 🔀 SHUFFLE  (!shuffle)
-  // ─────────────────────────────────────────────
-  if (command === "shuffle") {
-    const serverQueue = queues.get(message.guild.id);
+  // ────────────────────────────────────────────────────────────
+  // /shuffle
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "shuffle") {
+    const serverQueue = queues.get(guild.id);
     if (!serverQueue || serverQueue.songs.length === 0) {
-      return message.reply("📭 Queue is empty.");
+      return interaction.reply({
+        content: "📭 Queue is empty.",
+        ephemeral: true,
+      });
     }
     serverQueue.shuffle();
-    message.reply("🔀 Queue shuffled!");
-    return;
+    return interaction.reply("🔀 Queue shuffled!");
   }
 
-  // ─────────────────────────────────────────────
-  // 🗑️ CLEAR  (!clear)
-  // ─────────────────────────────────────────────
-  if (command === "clear") {
-    const serverQueue = queues.get(message.guild.id);
+  // ────────────────────────────────────────────────────────────
+  // /clear
+  // ────────────────────────────────────────────────────────────
+  if (commandName === "clear") {
+    const serverQueue = queues.get(guild.id);
     if (!serverQueue || serverQueue.songs.length === 0) {
-      return message.reply("📭 Queue is already empty.");
+      return interaction.reply({
+        content: "📭 Queue is already empty.",
+        ephemeral: true,
+      });
     }
     const count = serverQueue.songs.length;
     serverQueue.clear();
-    message.reply(`🗑️ Cleared **${count}** songs from the queue.`);
-    return;
-  }
-
-  // ─────────────────────────────────────────────
-  // ❓ HELP  (!help / !h)
-  // ─────────────────────────────────────────────
-  if (command === "help" || command === "h") {
-    message.reply(
-      "🎵 **Music Bot Commands:**\n" +
-        "`!play <name/url/playlist>` or `!p` — Play a song, search by name, or load a playlist\n" +
-        "`!skip` or `!s`                     — Skip current song\n" +
-        "`!stop`                             — Stop and leave channel\n" +
-        "`!queue` or `!q`                    — Show queue\n" +
-        "`!shuffle`                          — Shuffle queue\n" +
-        "`!clear`                            — Clear the queue\n" +
-        "`!help`                             — Show this message",
-    );
-    return;
+    return interaction.reply(`🗑️ Cleared **${count}** songs from the queue.`);
   }
 });
 

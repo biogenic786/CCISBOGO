@@ -16,7 +16,6 @@ class Queue {
     return this.songs.length === 0;
   }
 
-  // Fisher-Yates shuffle
   shuffle() {
     for (let i = this.songs.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
